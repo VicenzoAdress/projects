@@ -1,0 +1,150 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// Wi-Fi
+const char* ssid = "S22 Ultra de Murilo";
+const char* password = "mirilo070706";
+
+// API
+const char* webhookToken = "f17e6fb4-e576-49f5-ab12-0bf7aaf99315";
+const char* serverName = "https://reflora.onrender.com/api/webhook/sensors/data";
+
+// Pinos do LoRa
+#define SS_PIN    5
+#define RST_PIN   14
+#define DIO0_PIN  26
+
+void setup() {
+  Serial.begin(115200);
+
+  // Conecta ao Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando ao Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(1000);
+  }
+  Serial.println("\nConectado ao Wi-Fi!");
+
+  // Inicializa LoRa
+  LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
+  if (!LoRa.begin(915E6)) {
+    Serial.println("Erro ao iniciar LoRa!");
+    while (1);
+  }
+  Serial.println("LoRa iniciado com sucesso!");
+}
+
+// ===== Fuzzy Gaussiana =====
+float pertinenciaGaussiana(float x, float c, float sigma) {
+  return exp(-pow((x - c), 2) / (2 * pow(sigma, 2)));
+}
+
+String fuzzyToStatus(float valor, float ideal, float alertaMin, float alertaMax, float criticoMin, float criticoMax) {
+  float ok = pertinenciaGaussiana(valor, ideal, 3.0);
+  float alerta = max(
+    pertinenciaGaussiana(valor, alertaMin, 3.0),
+    pertinenciaGaussiana(valor, alertaMax, 3.0)
+  );
+  float critico = max(
+    pertinenciaGaussiana(valor, criticoMin, 3.0),
+    pertinenciaGaussiana(valor, criticoMax, 3.0)
+  );
+
+  if (critico > alerta && critico > ok) return "Crítico";
+  else if (alerta > ok) return "Alerta";
+  else return "Ok";
+}
+
+// ===== Função para extrair valores do JSON LoRa =====
+float extractValue(String json, String key) {
+  int index = json.indexOf("\"" + key + "\":");
+  if (index == -1) return 0.0;
+  int start = json.indexOf(":", index) + 1;
+  int end = json.indexOf(",", start);
+  if (end == -1) end = json.indexOf("}", start);
+  String value = json.substring(start, end);
+  return value.toFloat();
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 0) {
+    String loraPayload = "";
+    while (LoRa.available()) {
+      loraPayload += (char)LoRa.read();
+    }
+
+    Serial.println("Recebido via LoRa:");
+    Serial.println(loraPayload);
+
+    // Parse simples
+    float soilHumidity = extractValue(loraPayload, "soilHumidity");
+    float temperature = extractValue(loraPayload, "temperature");
+    float condutivity = extractValue(loraPayload, "condutivity");
+    float ph = extractValue(loraPayload, "ph");
+    float nitrogen = extractValue(loraPayload, "nitrogen");
+    float phosphorus = extractValue(loraPayload, "phosphorus");
+    float potassium = extractValue(loraPayload, "potassium");
+
+    // Fuzzy status para cada um
+    String statusSoil = fuzzyToStatus(soilHumidity, 50, 30, 70, 10, 80);
+    String statusTemp = fuzzyToStatus(temperature, 25, 15, 35, 5, 45);
+    String statusCond = fuzzyToStatus(condutivity, 300, 200, 500, 100, 700);
+    String statusPh = fuzzyToStatus(ph, 6.5, 5.5, 7.5, 4.5, 8.5);
+    String statusN = fuzzyToStatus(nitrogen, 30, 20, 50, 10, 70);
+    String statusP = fuzzyToStatus(phosphorus, 200, 150, 280, 80, 320);
+    String statusK = fuzzyToStatus(potassium, 190, 140, 240, 80, 300);
+
+    // Monta JSON para API
+    String newPayload = "{";
+
+    newPayload += "\"soilHumidity\":" + String(soilHumidity) + ",";
+    newPayload += "\"level_humidity\":\"" + statusSoil + "\",";
+
+    newPayload += "\"temperature\":" + String(temperature) + ",";
+    newPayload += "\"level_temperature\":\"" + statusTemp + "\",";
+
+    newPayload += "\"condutivity\":" + String(condutivity) + ",";
+    newPayload += "\"level_condutivity\":\"" + statusCond + "\",";
+
+    newPayload += "\"ph\":" + String(ph) + ",";
+    newPayload += "\"level_ph\":\"" + statusPh + "\",";
+
+    newPayload += "\"nitrogen\":" + String(nitrogen) + ",";
+    newPayload += "\"level_nitrogen\":\"" + statusN + "\",";
+
+    newPayload += "\"phosphorus\":" + String(phosphorus) + ",";
+    newPayload += "\"level_phosphorus\":\"" + statusP + "\",";
+
+    newPayload += "\"potassium\":" + String(potassium) + ",";
+    newPayload += "\"level_potassium\":\"" + statusK + "\"";
+
+    newPayload += "}";
+
+    Serial.println("Payload com Fuzzy:");
+    Serial.println(newPayload);
+
+    // Envia para API
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+
+      String url = String(serverName) + "?token=" + webhookToken;
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+
+      int httpResponseCode = http.POST(newPayload);
+
+      Serial.println("Enviado para API: " + newPayload);
+      Serial.println("Resposta: " + String(httpResponseCode));
+
+      http.end();
+    } else {
+      Serial.println("Wi-Fi desconectado!");
+    }
+  }
+
+  delay(100);
+}

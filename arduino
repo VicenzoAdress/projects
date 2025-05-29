@@ -1,0 +1,116 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <SoftwareSerial.h>
+
+#define RE 8
+#define DE 7
+#define SOIL_ANALOG_PIN A0 // Sensor capacitivo HW-380
+
+#define LORA_SS 10
+#define LORA_RST 9
+#define LORA_DIO0 5
+
+SoftwareSerial mod(2, 3); // RX, TX para RS485
+
+const byte lerTodosOsSensores[] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08 };
+byte resposta[25];
+
+void setup() {
+  Serial.begin(4800);
+  mod.begin(4800);
+
+  pinMode(RE, OUTPUT);
+  pinMode(DE, OUTPUT);
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
+
+  // Inicializa LoRa
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(915E6)) {
+    Serial.println("Erro ao iniciar LoRa!");
+    while (1);
+  }
+
+  Serial.println("Reflora - Leitura dos sensores e envio via LoRa");
+}
+
+float lerUmidadeCapacitiva() {
+  const int leituraMin = 500;
+  const int leituraMax = 200;
+  int leitura = analogRead(SOIL_ANALOG_PIN);
+  float umidade = map(leitura, leituraMin, leituraMax, 0, 100);
+  return umidade;
+}
+
+void loop() {
+  // Requisição Modbus para sensor NPK
+  digitalWrite(DE, HIGH);
+  digitalWrite(RE, HIGH);
+  delay(5);
+  mod.write(lerTodosOsSensores, sizeof(lerTodosOsSensores));
+  mod.flush();
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
+
+  delay(1000); // Aguarda resposta
+  int i = 0;
+  while (mod.available() && i < sizeof(resposta)) {
+    resposta[i++] = mod.read();
+  }
+
+  if (i >= 17) {
+    uint16_t crcRecebido = (resposta[i - 1] << 8) | resposta[i - 2];
+    uint16_t crcCalculado = calcularCRC(resposta, i - 2);
+
+    if (crcRecebido == crcCalculado) {
+      // Leitura dos sensores
+      float umidadeCapacitiva = lerUmidadeCapacitiva();
+      float umidadeNPK = (resposta[3] << 8 | resposta[4]) / 10.0;
+      float temperatura = (resposta[5] << 8 | resposta[6]) / 10.0;
+      float condutividade = resposta[7] << 8 | resposta[8];
+      float ph = (resposta[9] << 8 | resposta[10]) / 10.0;
+      float nitrogenio = resposta[11] << 8 | resposta[12];
+      float fosforo = resposta[13] << 8 | resposta[14];
+      float potassio = resposta[15] << 8 | resposta[16];
+
+      // JSON com os dados
+      String jsonPayload = "{";
+      jsonPayload += "\"soilHumidity\":" + String(umidadeCapacitiva) + ",";
+      jsonPayload += "\"temperature\":" + String(temperatura) + ",";
+      jsonPayload += "\"condutivity\":" + String(condutividade) + ",";
+      jsonPayload += "\"ph\":" + String(ph) + ",";
+      jsonPayload += "\"nitrogen\":" + String(nitrogenio) + ",";
+      jsonPayload += "\"phosphorus\":" + String(fosforo) + ",";
+      jsonPayload += "\"potassium\":" + String(potassio);
+      jsonPayload += "}";
+
+      Serial.println("📡 Enviando via LoRa:");
+      Serial.println(jsonPayload);
+
+      LoRa.beginPacket();
+      LoRa.print(jsonPayload);
+      LoRa.endPacket();
+    } else {
+      Serial.println("❌ Erro de CRC.");
+    }
+  } else {
+    Serial.println("❌ Erro: Resposta incompleta ou ausente.");
+  }
+ 
+  Serial.println("--------------------------------------------------");
+  delay(30000); // Espera 1 hora (3600000ms) entre leituras
+}
+
+uint16_t calcularCRC(byte *data, byte length) {
+  uint16_t crc = 0xFFFF;
+  for (byte i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (byte j = 0; j < 8; j++) {
+      if (crc & 0x0001)
+        crc = (crc >> 1) ^ 0xA001;
+      else
+        crc >>= 1;
+    }
+  }
+  return crc;
+}
